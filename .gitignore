@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+.env
+
+# Dataset — too large for GitHub
+dataset/
+
+# Trained model
+trainer/trainer.yml
+
+# Attendance database
+attendance/
+
+# PyInstaller build output
+dist/
+build/
+*.spec
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE files
+.vscode/
+.idea/
+*.swp
