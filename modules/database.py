@@ -1,17 +1,3 @@
-# modules/database.py
-"""
-DATABASE MODULE — SESSION-AWARE
-================================
-Every attendance entry belongs to a SESSION.
-A session has: ID, subject name, teacher, date, start time, duration.
-
-Key design:
-  - Sessions table: one row per class/lecture
-  - Attendance table: one row per student per session
-  - When app launches, teacher picks an existing active session OR creates new one
-  - "Active" = session whose (start_time + duration) has not passed yet
-"""
-
 import sqlite3
 import os
 import json
