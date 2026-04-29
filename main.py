@@ -580,14 +580,73 @@ class AttendanceApp:
                 return
             print("✓ Webcam opened")
 
-            CONFIDENCE_THRESHOLD = 70
-            fail_count = 0          # consecutive frame failures
-            MAX_FAILS = 30          # stop if 30 consecutive failures
+            # ════════════════════════════════════════════════
+            # RECOGNITION PARAMETERS
+            # ════════════════════════════════════════════════
+
+            CONFIDENCE_THRESHOLD = 60   # Stricter than before (was 70)
+                                        # Lower number = stricter match required
+                                        # 60 means: only mark if very confident
+
+            # ── VOTING SYSTEM ────────────────────────────────
+            # Instead of marking on ONE frame, we collect votes
+            # across multiple frames. Only mark when enough frames
+            # agree on the same person.
+            #
+            # votes dict structure:
+            # {
+            #   face_position_key: {
+            #     "name": most_common_prediction,
+            #     "count": how_many_frames_agreed,
+            #     "confidences": [list of confidence values]
+            #   }
+            # }
+            #
+            # We use a simple list of recent predictions per face slot.
+            # face_slot = grid position (coarse x,y bucket) so the same
+            # physical face maps to the same slot across frames.
+
+            VOTES_NEEDED = 15       # Must see same person in 15 frames to mark
+                                    # At ~10fps that is ~1.5 seconds of looking
+            VOTE_WINDOW  = 25       # Keep only last 25 predictions per slot
+                                    # Older predictions are discarded
+
+            # vote_buffer[slot_key] = list of (name, confidence) tuples
+            from collections import defaultdict, Counter
+            vote_buffer = defaultdict(list)
+
+            # ── LIVENESS DETECTION ───────────────────────────
+            # Uses eye aspect ratio (EAR) to detect blinking.
+            # A real face blinks. A photo/screen never blinks.
+            #
+            # EAR = (vertical eye distances) / (horizontal eye distance)
+            # Open eye  → EAR ≈ 0.25-0.30
+            # Closed eye → EAR ≈ 0.10-0.15
+            #
+            # We need the facial landmark predictor from OpenCV.
+            # We use the built-in eye cascade as a simpler alternative
+            # that does not require dlib.
+
+            eye_cascade = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_eye.xml"
+            )
+
+            # liveness_buffer[slot_key] = list of eye_open booleans
+            # True = eyes detected (open), False = eyes not detected (closed/blink)
+            liveness_buffer  = defaultdict(list)
+            LIVENESS_WINDOW  = 30   # check last 30 frames for a blink
+            BLINK_REQUIRED   = True # set False to disable liveness for testing
+
+            # ── PENDING CONFIRMATION DISPLAY ─────────────────
+            # Shows a yellow "Confirming... X/15" bar under the face
+            # so the student sees progress toward being marked
+
+            fail_count = 0
+            MAX_FAILS  = 30
 
             # ── Step 9: Main loop ─────────────────────────────
             while self.webcam_running:
 
-                # Safety: stop if session expired
                 if not db.is_session_active(session_id):
                     self.root.after(0, lambda: messagebox.showinfo(
                         "Session Expired",
@@ -595,7 +654,6 @@ class AttendanceApp:
                     break
 
                 ret, frame = cap.read()
-
                 if not ret:
                     fail_count += 1
                     if fail_count >= MAX_FAILS:
@@ -605,70 +663,177 @@ class AttendanceApp:
                             "Check your webcam and try again."))
                         break
                     continue
+                fail_count = 0
 
-                fail_count = 0   # reset on successful frame
-
-                # Preprocess
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 gray_eq = cv2.equalizeHist(gray)
 
-                # Detect faces
                 faces = face_cascade.detectMultiScale(
                     gray_eq, scaleFactor=1.1, minNeighbors=5,
                     minSize=(80, 80))
 
-                # Process each face
+                # Track which slots are active this frame
+                active_slots = set()
+
                 for (x, y, w, h) in faces:
+
+                    # ── Slot key ─────────────────────────────
+                    # Divide frame into a coarse 4x4 grid.
+                    # Faces in the same grid cell = same person slot.
+                    # This tolerates slight head movement between frames.
+                    slot_x = x // (frame.shape[1] // 4 + 1)
+                    slot_y = y // (frame.shape[0] // 4 + 1)
+                    slot   = (slot_x, slot_y)
+                    active_slots.add(slot)
+
+                    # ── Recognition ──────────────────────────
                     face_crop = cv2.resize(gray_eq[y:y+h, x:x+w], (200, 200))
                     label, confidence = recognizer.predict(face_crop)
 
                     if confidence < CONFIDENCE_THRESHOLD:
-                        user_name = names.get(str(label), f"ID_{label}")
+                        pred_name = names.get(str(label), f"ID_{label}")
+                    else:
+                        pred_name = "Unknown"
 
-                        # Try to mark — returns True only if NEW (not duplicate)
-                        newly_marked = db.mark_attendance(session_id, user_name, label)
+                    # ── Liveness check ───────────────────────
+                    # Detect eyes inside the face region.
+                    # If eyes found → open. No eyes → closed (blink).
+                    face_roi  = gray_eq[y:y+h, x:x+w]
+                    eyes      = eye_cascade.detectMultiScale(
+                        face_roi, scaleFactor=1.1,
+                        minNeighbors=5, minSize=(20, 20))
+                    eyes_open = len(eyes) >= 1   # at least one eye visible
 
+                    liveness_buffer[slot].append(eyes_open)
+                    if len(liveness_buffer[slot]) > LIVENESS_WINDOW:
+                        liveness_buffer[slot].pop(0)
+
+                    # A blink = at least one False in the liveness window
+                    blink_detected = (not all(liveness_buffer[slot])
+                                      and len(liveness_buffer[slot]) >= 10)
+                    is_live = blink_detected or not BLINK_REQUIRED
+
+                    # ── Vote accumulation ─────────────────────
+                    vote_buffer[slot].append((pred_name, confidence))
+                    if len(vote_buffer[slot]) > VOTE_WINDOW:
+                        vote_buffer[slot].pop(0)
+
+                    # Count votes for each name in the window
+                    recent_names = [v[0] for v in vote_buffer[slot]]
+                    name_counts  = Counter(recent_names)
+                    top_name, top_count = name_counts.most_common(1)[0]
+
+                    # Average confidence for the top name only
+                    top_confs = [v[1] for v in vote_buffer[slot]
+                                 if v[0] == top_name]
+                    avg_conf  = sum(top_confs) / len(top_confs)
+
+                    # ── Decision ─────────────────────────────
+                    already_marked = top_name in marked_this_run
+                    confirmed      = (top_count  >= VOTES_NEEDED
+                                      and top_name != "Unknown"
+                                      and is_live)
+
+                    if confirmed and not already_marked:
+                        # ── MARK ATTENDANCE ──────────────────
+                        newly_marked = db.mark_attendance(
+                            session_id, top_name, label)
                         if newly_marked:
-                            marked_this_run.add(user_name)
+                            marked_this_run.add(top_name)
+                            vote_buffer[slot].clear()   # reset votes for this slot
+                            liveness_buffer[slot].clear()
                             present_count = len(marked_this_run)
-                            self.root.after(0, lambda n=user_name:
+                            self.root.after(0, lambda n=top_name:
                                 self.last_recognized_var.set(f"Last: {n} ✓"))
                             self.root.after(0, lambda c=present_count:
                                 self.marked_count_var.set(f"Present: {c}"))
-                            print(f"✓ MARKED: {user_name}  confidence={confidence:.1f}")
+                            print(f"✓ MARKED: {top_name}  "
+                                  f"votes={top_count}  "
+                                  f"avg_conf={avg_conf:.1f}  "
+                                  f"live={is_live}")
 
-                        # Green = newly marked, Orange = already marked this session
-                        color = (0, 200, 80) if newly_marked or user_name not in marked_this_run else (0, 165, 255)
-                        tag = "✓" if user_name in marked_this_run else ""
-                        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-                        cv2.putText(frame, f"{user_name} {tag} ({confidence:.0f})",
-                                    (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.65, color, 2)
+                    # ── Draw on frame ─────────────────────────
+                    if top_name == "Unknown" or len(vote_buffer[slot]) < 5:
+                        # Not enough data yet or unknown
+                        color = (80, 80, 220)   # blue
+                        label_txt = "Scanning..."
+                    elif already_marked:
+                        color = (0, 165, 255)   # orange = already done
+                        label_txt = f"{top_name} ✓ (marked)"
+                    elif not is_live and BLINK_REQUIRED:
+                        color = (0, 0, 255)     # red = liveness failed
+                        label_txt = f"{top_name} — BLINK TO VERIFY"
+                    elif confirmed:
+                        color = (0, 255, 100)   # bright green = just confirmed
+                        label_txt = f"{top_name} ✓"
                     else:
-                        cv2.rectangle(frame, (x, y), (x+w, y+h), (80, 80, 220), 2)
-                        cv2.putText(frame, "Unknown",
-                                    (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.65, (80, 80, 220), 2)
+                        # Accumulating votes — show yellow progress bar
+                        color = (0, 220, 220)   # yellow
+                        label_txt = f"{top_name} ({top_count}/{VOTES_NEEDED})"
 
-                # HUD overlay — use local session_subject (not self.current_session)
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+                    cv2.putText(frame, label_txt,
+                                (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.60, color, 2)
+
+                    # Progress bar under face rectangle
+                    if not already_marked and top_name != "Unknown":
+                        bar_w     = int(w * min(top_count, VOTES_NEEDED) / VOTES_NEEDED)
+                        bar_color = (0, 255, 100) if is_live else (0, 100, 255)
+                        cv2.rectangle(frame,
+                                      (x, y + h + 4),
+                                      (x + bar_w, y + h + 12),
+                                      bar_color, -1)
+                        cv2.rectangle(frame,
+                                      (x, y + h + 4),
+                                      (x + w, y + h + 12),
+                                      (60, 60, 60), 1)
+
+                    # Liveness indicator dot
+                    dot_color = (0, 255, 100) if is_live else (0, 0, 255)
+                    cv2.circle(frame, (x + w - 10, y + 10), 6, dot_color, -1)
+                    cv2.putText(frame,
+                                "LIVE" if is_live else "BLINK",
+                                (x + w - 45, y + 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                                dot_color, 1)
+
+                # Clear vote buffers for slots with no face this frame
+                # (person walked away — reset their vote count)
+                for slot in list(vote_buffer.keys()):
+                    if slot not in active_slots:
+                        vote_buffer[slot].clear()
+                        liveness_buffer[slot].clear()
+
+                # ── HUD overlay ───────────────────────────────
                 secs_left = db.get_seconds_remaining(session_id)
-                mm, ss = divmod(secs_left, 60)
-                hh, mm = divmod(mm, 60)
+                mm, ss    = divmod(secs_left, 60)
+                hh, mm    = divmod(mm, 60)
 
                 cv2.putText(frame, f"Subject: {session_subject}",
-                            (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                            (10, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (255, 255, 255), 1)
                 cv2.putText(frame, f"Timer: {hh:02d}:{mm:02d}:{ss:02d}",
-                            (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 220, 255), 1)
+                            (10, 52), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (100, 220, 255), 1)
                 cv2.putText(frame, f"Present: {len(marked_this_run)}",
-                            (10, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 150), 1)
+                            (10, 76), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (100, 255, 150), 1)
                 cv2.putText(frame, datetime.now().strftime("%H:%M:%S"),
-                            (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+                            (10, 100), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (200, 200, 200), 1)
+
+                liveness_txt = "Liveness: ON" if BLINK_REQUIRED else "Liveness: OFF"
+                liveness_col = (0, 255, 100)  if BLINK_REQUIRED else (0, 100, 255)
+                cv2.putText(frame, liveness_txt,
+                            (10, 124), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.50, liveness_col, 1)
 
                 # Send to GUI
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame_resized = cv2.resize(frame_rgb, (590, 450))
-                pil_img = Image.fromarray(frame_resized)
-                tk_img = ImageTk.PhotoImage(pil_img)
+                pil_img      = Image.fromarray(frame_resized)
+                tk_img       = ImageTk.PhotoImage(pil_img)
                 self.root.after(0, lambda i=tk_img: self._set_camera_frame(i))
 
         except Exception as e:
